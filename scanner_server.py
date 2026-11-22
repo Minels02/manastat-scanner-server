@@ -49,7 +49,7 @@ def _build_usearch_background() -> None:
             metric="cos",
             dtype="i8" if is_int8 else "f32",
             connectivity=24,
-            expansion_add=64,
+            expansion_add=96,
             expansion_search=96,
         )
         keys = np.arange(n, dtype=np.uint64)
@@ -305,12 +305,12 @@ def _search_single_vector(
 ) -> list[tuple[int, float]]:
     assert VECTORS is not None
     is_int8 = VECTORS.dtype == np.int8
+    scale = (1.0 / 127.0) if is_int8 else 1.0
 
-    # 1) Se ci sono espansioni filtrate, ricerca diretta sul sottoinsieme (pochissimi ms)
+    # 1) Ricerca esatta sul sottoinsieme di espansioni filtrate
     if subset_indices is not None:
         if len(subset_indices) == 0:
             return []
-        scale = (1.0 / 127.0) if is_int8 else 1.0
         sub = VECTORS[subset_indices].astype(np.float32)
         sims = sub @ (q_vec * scale)
         k = min(top_k, len(sims))
@@ -318,18 +318,22 @@ def _search_single_vector(
         top_local = top_local[np.argsort(-sims[top_local])]
         return [(int(subset_indices[i]), float(sims[i])) for i in top_local]
 
-    # 2) Ricerca globale velocissima tramite USearch HNSW (se pronto)
+    # 2) Ricerca globale USearch + ri-ordinamento esatto sui top 50
     if USEARCH_READY and USEARCH_INDEX is not None:
         q_in = np.clip(np.round(q_vec * 127.0), -127, 127).astype(np.int8) if is_int8 else q_vec
-        matches = USEARCH_INDEX.search(q_in, top_k)
-        out: list[tuple[int, float]] = []
-        for m in matches:
-            sim = float(1.0 - float(m.distance))
-            out.append((int(m.key), sim))
-        return out
+        fetch_k = max(top_k, 50)
+        matches = USEARCH_INDEX.search(q_in, fetch_k)
+        cand_keys = np.array([int(m.key) for m in matches], dtype=np.int64)
+        if len(cand_keys) == 0:
+            return []
+        sub = VECTORS[cand_keys].astype(np.float32)
+        sims = sub @ (q_vec * scale)
+        k = min(top_k, len(sims))
+        top_local = np.argpartition(-sims, k - 1)[:k]
+        top_local = top_local[np.argsort(-sims[top_local])]
+        return [(int(cand_keys[i]), float(sims[i])) for i in top_local]
 
-    # 3) Fallback NumPy 1D (usato solo nei primi secondi mentre USearch si costruisce)
-    scale = (1.0 / 127.0) if is_int8 else 1.0
+    # 3) Fallback NumPy 1D
     q_scaled = q_vec * scale
     n = VECTORS.shape[0]
     sims = np.empty(n, dtype=np.float32)
@@ -342,7 +346,6 @@ def _search_single_vector(
     top_local = np.argpartition(-sims, k - 1)[:k]
     top_local = top_local[np.argsort(-sims[top_local])]
     return [(int(i), float(sims[i])) for i in top_local]
-
 
 def match_warped_card(
     card_bgr: np.ndarray,
@@ -365,29 +368,42 @@ def match_warped_card(
             return []
 
     norm_card = normalize_lighting_bgr(card_bgr)
+    internal_k = max(top_k, 10)
 
-    # 1° passaggio veloce: solo dritta standard
+    # 1° passaggio: carta dritta
     q_main = compute_card_descriptor(norm_card, crop_margin=0.0)
-    hits = _search_single_vector(q_main, top_k=top_k, subset_indices=subset_indices)
+    hits = _search_single_vector(q_main, top_k=internal_k, subset_indices=subset_indices)
     best_score = hits[0][1] if hits else 0.0
 
-    # Fallback leggero solo per carte in bustina/sleeve se il primo score è basso
-    if best_score < 0.68:
-        q_sleeve = compute_card_descriptor(norm_card, crop_margin=0.04)
-        hits_sleeve = _search_single_vector(q_sleeve, top_k=top_k, subset_indices=subset_indices)
-        merged: dict[int, float] = {}
-        for idx, sc in hits + hits_sleeve:
+    merged: dict[int, float] = {idx: sc for idx, sc in hits}
+
+    # 2° passaggio: ruotata di 180° se il primo score non è alto
+    if best_score < 0.74:
+        rot180 = cv2.rotate(norm_card, cv2.ROTATE_180)
+        q_180 = compute_card_descriptor(rot180, crop_margin=0.0)
+        for idx, sc in _search_single_vector(q_180, top_k=internal_k, subset_indices=subset_indices):
             if idx not in merged or sc > merged[idx]:
                 merged[idx] = sc
-        hits = sorted(merged.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        best_score = max(merged.values(), default=0.0)
+
+    # 3° passaggio: ritaglio bustina/sleeve solo se ancora sotto soglia
+    if best_score < 0.72:
+        q_sleeve = compute_card_descriptor(norm_card, crop_margin=0.04)
+        for idx, sc in _search_single_vector(q_sleeve, top_k=internal_k, subset_indices=subset_indices):
+            if idx not in merged or sc > merged[idx]:
+                merged[idx] = sc
+
+    ranked = sorted(merged.items(), key=lambda x: x[1], reverse=True)
 
     results = []
-    for global_idx, score in hits:
+    for global_idx, score in ranked:
         if score < 0.66:
             continue
         item = dict(METADATA[global_idx])
         item["confidence"] = round(score, 4)
         results.append(item)
+        if len(results) >= top_k:
+            break
     return results
 
 
