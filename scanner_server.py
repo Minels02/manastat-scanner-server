@@ -18,6 +18,8 @@ try:
 except Exception:
     USearchIndex = None
 
+SERVER_VERSION = "v2.1"
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "mobilenet_v3_small.onnx")
 VECTORS_PATH = os.path.join(BASE_DIR, "vectors.npy")
@@ -33,8 +35,8 @@ AVAILABLE_SETS: list[dict[str, Any]] = []
 USEARCH_INDEX: Any = None
 USEARCH_READY: bool = False
 
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
-IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 def _build_usearch_background() -> None:
@@ -59,7 +61,7 @@ def _build_usearch_background() -> None:
             idx.add(keys[start:end], VECTORS[start:end], threads=1)
         USEARCH_INDEX = idx
         USEARCH_READY = True
-        print(f"[Scanner] Indice USearch pronto ({n} carte, dtype={'i8' if is_int8 else 'f32'}).")
+        print(f"[Scanner {SERVER_VERSION}] Indice USearch pronto ({n} carte).")
     except Exception as exc:
         print(f"[Scanner] USearch non disponibile, uso fallback NumPy: {exc}")
         USEARCH_INDEX = None
@@ -80,7 +82,7 @@ def load_resources() -> None:
             providers=["CPUExecutionProvider"],
         )
         ORT_INPUT_NAME = ORT_SESSION.get_inputs()[0].name
-        print("[Scanner] Modello MobileNetV3 ONNX caricato (1 thread).")
+        print(f"[Scanner {SERVER_VERSION}] Modello MobileNetV3 ONNX caricato (1 thread).")
     else:
         print(f"[Scanner] ATTENZIONE: modello non trovato in {MODEL_PATH}")
 
@@ -109,7 +111,7 @@ def load_resources() -> None:
             ],
             key=lambda x: x["name"].lower(),
         )
-        print(f"[Scanner] Indice caricato da {BASE_DIR}: {len(METADATA)} carte, {len(AVAILABLE_SETS)} set.")
+        print(f"[Scanner {SERVER_VERSION}] Indice caricato: {len(METADATA)} carte, {len(AVAILABLE_SETS)} set.")
 
         threading.Thread(target=_build_usearch_background, daemon=True).start()
     else:
@@ -136,6 +138,7 @@ app.add_middleware(
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
+        "version": SERVER_VERSION,
         "model": "mobilenet_v3_small_onnx" if ORT_SESSION is not None else "missing",
         "indexed_cards": len(METADATA),
         "sets_count": len(AVAILABLE_SETS),
@@ -277,23 +280,28 @@ def normalize_lighting_bgr(img_bgr: np.ndarray) -> np.ndarray:
 
 
 def compute_card_descriptor(card_bgr: np.ndarray, crop_margin: float = 0.0) -> np.ndarray:
+    """Identico a build_index.py: ritaglia la zona artwork MTG (y: 49..197, x: 20..232)."""
     assert ORT_SESSION is not None
-    h, w = card_bgr.shape[:2]
+    resized = cv2.resize(card_bgr, (252, 352), interpolation=cv2.INTER_AREA)
+
+    y1, y2 = 49, 197
+    x1, x2 = 20, 232
     if crop_margin > 0.0:
-        dx = int(w * crop_margin)
-        dy = int(h * crop_margin)
-        card_bgr = card_bgr[dy : h - dy, dx : w - dx]
+        dy = int((y2 - y1) * crop_margin)
+        dx = int((x2 - x1) * crop_margin)
+        y1, y2 = y1 + dy, y2 - dy
+        x1, x2 = x1 + dx, x2 - dx
 
-    rgb = cv2.cvtColor(card_bgr, cv2.COLOR_BGR2RGB)
-    resized = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA)
-    arr = resized.astype(np.float32) / 255.0
-    arr = np.transpose(arr, (2, 0, 1))[None, ...]
-    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
+    art = resized[y1:y2, x1:x2]
+    rgb = cv2.cvtColor(art, cv2.COLOR_BGR2RGB)
+    img_224 = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    img_224 = (img_224 - IMAGENET_MEAN) / IMAGENET_STD
+    inp = np.transpose(img_224, (2, 0, 1))[None, ...].astype(np.float32)
 
-    out = ORT_SESSION.run(None, {ORT_INPUT_NAME: arr})[0]
+    out = ORT_SESSION.run(None, {ORT_INPUT_NAME: inp})[0]
     vec = out.reshape(-1).astype(np.float32)
     norm = float(np.linalg.norm(vec))
-    if norm > 1e-8:
+    if norm > 1e-6:
         vec /= norm
     return vec
 
@@ -347,6 +355,7 @@ def _search_single_vector(
     top_local = top_local[np.argsort(-sims[top_local])]
     return [(int(i), float(sims[i])) for i in top_local]
 
+
 def match_warped_card(
     card_bgr: np.ndarray,
     top_k: int = 5,
@@ -370,23 +379,14 @@ def match_warped_card(
     norm_card = normalize_lighting_bgr(card_bgr)
     internal_k = max(top_k, 10)
 
-    # 1° passaggio: carta dritta
+    # 1° passaggio veloce: carta dritta standard
     q_main = compute_card_descriptor(norm_card, crop_margin=0.0)
     hits = _search_single_vector(q_main, top_k=internal_k, subset_indices=subset_indices)
     best_score = hits[0][1] if hits else 0.0
 
     merged: dict[int, float] = {idx: sc for idx, sc in hits}
 
-    # 2° passaggio: ruotata di 180° se il primo score non è alto
-    if best_score < 0.74:
-        rot180 = cv2.rotate(norm_card, cv2.ROTATE_180)
-        q_180 = compute_card_descriptor(rot180, crop_margin=0.0)
-        for idx, sc in _search_single_vector(q_180, top_k=internal_k, subset_indices=subset_indices):
-            if idx not in merged or sc > merged[idx]:
-                merged[idx] = sc
-        best_score = max(merged.values(), default=0.0)
-
-    # 3° passaggio: ritaglio bustina/sleeve solo se ancora sotto soglia
+    # 2° passaggio leggero solo per carte in bustina/sleeve se il punteggio è basso
     if best_score < 0.72:
         q_sleeve = compute_card_descriptor(norm_card, crop_margin=0.04)
         for idx, sc in _search_single_vector(q_sleeve, top_k=internal_k, subset_indices=subset_indices):
@@ -397,7 +397,7 @@ def match_warped_card(
 
     results = []
     for global_idx, score in ranked:
-        if score < 0.66:
+        if score < 0.62:
             continue
         item = dict(METADATA[global_idx])
         item["confidence"] = round(score, 4)
@@ -431,6 +431,7 @@ def analyze_frame_bytes(
 @app.websocket("/ws/scan")
 async def scan_websocket(websocket: WebSocket):
     await websocket.accept()
+    await websocket.send_json({"type": "hello", "server_version": SERVER_VERSION})
     allowed_sets: list[str] | None = None
     try:
         while True:
