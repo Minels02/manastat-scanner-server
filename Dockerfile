@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY scanner_server.py build_index.py mobilenet_v3_small.onnx vectors.npy metadata.json ./
+COPY scanner_server.py build_index.py mobilenet_v3_small.onnx mobilenet_v3_small.onnx.data vectors.npy metadata.json ./
 
 EXPOSE 7860
 
