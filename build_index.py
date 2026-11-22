@@ -12,53 +12,70 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2
 import numpy as np
 import requests
+import onnxruntime as ort
 
+LOCAL_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".gestione_mazzi_cache", "scanner_index")
+MODEL_PATH = os.path.join(LOCAL_DIR, "mobilenet_v3_small.onnx")
+
 SCRYFALL_HEADERS = {
     "User-Agent": "ManaStatDesktopApp/3.0",
     "Accept": "application/json",
 }
 
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-def compute_card_descriptor(card_bgr: np.ndarray) -> np.ndarray:
+_ORT_SESSION: ort.InferenceSession | None = None
+
+
+def _get_ort_session() -> ort.InferenceSession:
+    global _ORT_SESSION
+    if _ORT_SESSION is None:
+        if not os.path.exists(MODEL_PATH):
+            raise FileNotFoundError(
+                f"Modello ONNX non trovato in {MODEL_PATH}. Esegui prima: python export_model.py"
+            )
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 2
+        opts.inter_op_num_threads = 1
+        _ORT_SESSION = ort.InferenceSession(
+            MODEL_PATH,
+            sess_options=opts,
+            providers=["CPUExecutionProvider"],
+        )
+    return _ORT_SESSION
+
+
+def compute_card_descriptor(card_bgr: np.ndarray, crop_margin: float = 0.0) -> np.ndarray:
     """
-    Calcola una firma visiva compatta (96 float32 L2-normalizzati) da una carta 252x352:
-    - 64 valori: gradienti DCT / luminanza dell'artwork centrale (struttura resistente a luce/lingua)
-    - 32 valori: distribuzione colore LAB normalizzata di artwork + cornice
+    Calcola un embedding visivo AI (576 float32 L2-normalizzati) dall'artwork della carta
+    usando MobileNetV3-Small via ONNX Runtime.
+    crop_margin > 0 restringe leggermente il ritaglio (utile per carte in bustina/sleeve).
     """
     resized = cv2.resize(card_bgr, (252, 352), interpolation=cv2.INTER_AREA)
 
     # Zona artwork standard MTG (y: 14%..56%, x: 8%..92%)
-    art = resized[49:197, 20:232]
+    y1, y2 = 49, 197
+    x1, x2 = 20, 232
+    if crop_margin > 0.0:
+        dy = int((y2 - y1) * crop_margin)
+        dx = int((x2 - x1) * crop_margin)
+        y1, y2 = y1 + dy, y2 - dy
+        x1, x2 = x1 + dx, x2 - dx
 
-    # 1) Struttura luminanza (pHash continuo 8x8 via DCT)
-    gray = cv2.cvtColor(art, cv2.COLOR_BGR2GRAY)
-    gray_32 = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
-    dct = cv2.dct(gray_32)
-    low_freq = dct[:8, :8].flatten()
-    low_freq[0] = 0.0
-    norm_dct = np.linalg.norm(low_freq)
-    if norm_dct > 1e-6:
-        low_freq = low_freq / norm_dct
+    art = resized[y1:y2, x1:x2]
+    rgb = cv2.cvtColor(art, cv2.COLOR_BGR2RGB)
+    img_224 = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    img_224 = (img_224 - IMAGENET_MEAN) / IMAGENET_STD
+    inp = np.transpose(img_224, (2, 0, 1))[None, ...].astype(np.float32)
 
-    # 2) Istogramma colore percettivo LAB (canali a e b, 4x4 bin) + bordo carta
-    lab_art = cv2.cvtColor(art, cv2.COLOR_BGR2LAB)
-    hist_ab = cv2.calcHist([lab_art], [1, 2], None, [4, 4], [0, 256, 0, 256]).flatten()
-    norm_ab = np.linalg.norm(hist_ab)
-    if norm_ab > 1e-6:
-        hist_ab = hist_ab / norm_ab
+    sess = _get_ort_session()
+    vec = sess.run(["embedding"], {"input": inp})[0][0].astype(np.float32)
 
-    frame_top = resized[8:42, 14:238]
-    lab_frame = cv2.cvtColor(frame_top, cv2.COLOR_BGR2LAB)
-    hist_frame = cv2.calcHist([lab_frame], [1, 2], None, [4, 4], [0, 256, 0, 256]).flatten()
-    norm_fr = np.linalg.norm(hist_frame)
-    if norm_fr > 1e-6:
-        hist_frame = hist_frame / norm_fr
-
-    vec = np.concatenate([low_freq * 1.4, hist_ab * 0.8, hist_frame * 0.6]).astype(np.float32)
-    total_norm = np.linalg.norm(vec)
-    if total_norm > 1e-6:
-        vec /= total_norm
+    norm = np.linalg.norm(vec)
+    if norm > 1e-6:
+        vec /= norm
     return vec
 
 
@@ -95,7 +112,6 @@ def _normalize_card_entry(c: dict) -> dict | None:
 
 
 def fetch_specific_sets(set_codes: set[str]) -> list[dict]:
-    """Scarica rapidamente solo i set richiesti via /cards/search senza dover scaricare l'intero bulk JSON."""
     filtered: list[dict] = []
     for code in sorted(set_codes):
         print(f"Recupero metadati set [{code.upper()}] da Scryfall...")
@@ -180,21 +196,24 @@ def _process_single_card(card: dict) -> tuple[dict, np.ndarray] | None:
         if bgr is None:
             return None
         vec = compute_card_descriptor(bgr)
-        return card, vec
+        # Quantizzazione compatta int8 (1 byte per valore -> ~65 MB per 114k carte)
+        vec_q = np.clip(np.round(vec * 127.0), -127, 127).astype(np.int8)
+        return card, vec_q
     except Exception:
         return None
 
 
 def build_index(set_codes: list[str] | None = None, workers: int = 8):
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    set_filter = {s.strip().lower() for s in set_codes if s.strip()} if set_codes else None
+    # Pre-carica la sessione ONNX sul thread principale
+    _get_ort_session()
 
+    set_filter = {s.strip().lower() for s in set_codes if s.strip()} if set_codes else None
     if set_filter:
         cards = fetch_specific_sets(set_filter)
     else:
         cards = download_bulk_metadata()
 
-    print(f"Carte da indicizzare: {len(cards)}")
+    print(f"Carte da indicizzare (MobileNetV3 ONNX): {len(cards)}")
     if not cards:
         print("Nessuna carta trovata.")
         sys.exit(1)
@@ -209,10 +228,10 @@ def build_index(set_codes: list[str] | None = None, workers: int = 8):
             done += 1
             res = fut.result()
             if res is not None:
-                c_meta, vec = res
+                c_meta, vec_q = res
                 c_meta.pop("thumb_url", None)
                 meta_out.append(c_meta)
-                vecs_out.append(vec)
+                vecs_out.append(vec_q)
             if done % 250 == 0 or done == len(cards):
                 print(f"Progresso: {done}/{len(cards)} (indicizzate: {len(meta_out)})")
 
@@ -220,21 +239,21 @@ def build_index(set_codes: list[str] | None = None, workers: int = 8):
         print("Nessuna carta indicizzata.")
         sys.exit(1)
 
-    matrix = np.vstack(vecs_out).astype(np.float32)
-    np.save(os.path.join(CACHE_DIR, "vectors.npy"), matrix)
-    with open(os.path.join(CACHE_DIR, "metadata.json"), "w", encoding="utf-8") as f:
+    matrix = np.vstack(vecs_out).astype(np.int8)
+    np.save(os.path.join(LOCAL_DIR, "vectors.npy"), matrix)
+    with open(os.path.join(LOCAL_DIR, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(meta_out, f, ensure_ascii=False)
 
-    print(f"Indice completato! {len(meta_out)} carte salvate in {CACHE_DIR}")
+    print(f"Indice AI completato! {len(meta_out)} carte salvate in {LOCAL_DIR}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Costruisce l'indice visivo delle carte Scryfall.")
+    parser = argparse.ArgumentParser(description="Costruisce l'indice visivo AI (MobileNetV3) delle carte Scryfall.")
     parser.add_argument(
         "--sets",
         nargs="*",
-        help="Codici set opzionali per un test veloce (es. --sets mh3 fdn blb). Se omesso indicizza tutto.",
+        help="Codici set opzionali per un test veloce. Se omesso indicizza tutto.",
     )
-    parser.add_argument("--workers", type=int, default=8, help="Thread paralleli di download.")
+    parser.add_argument("--workers", type=int, default=8, help="Thread paralleli di download/inferenza.")
     args = parser.parse_args()
     build_index(set_codes=args.sets, workers=args.workers)

@@ -11,9 +11,9 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 
-from build_index import CACHE_DIR, compute_card_descriptor
+from build_index import CACHE_DIR, compute_card_descriptor, _get_ort_session
 
-app = FastAPI(title="ManaStat Vision Scanner API")
+app = FastAPI(title="ManaStat Vision Scanner API (ONNX)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,31 +23,72 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-VECTORS: np.ndarray | None = None
+VECTORS: np.ndarray | None = None  # int8 (N, 576) oppure float32
 METADATA: list[dict[str, Any]] = []
+SET_TO_INDICES: dict[str, np.ndarray] = {}
+AVAILABLE_SETS: list[dict[str, Any]] = []
 
 
 def load_visual_index():
-    global VECTORS, METADATA
+    global VECTORS, METADATA, SET_TO_INDICES, AVAILABLE_SETS
     local_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Pre-carica il modello ONNX
+    try:
+        _get_ort_session()
+        print("[Scanner] Modello MobileNetV3 ONNX caricato.")
+    except Exception as e:
+        print(f"[Scanner] AVVISO modello ONNX: {e}")
+
     for base_dir in [local_dir, CACHE_DIR]:
         vec_path = os.path.join(base_dir, "vectors.npy")
         meta_path = os.path.join(base_dir, "metadata.json")
         if os.path.exists(vec_path) and os.path.exists(meta_path):
-            VECTORS = np.load(vec_path).astype(np.float32)
+            VECTORS = np.load(vec_path)  # mantiene int8 per risparmiare RAM su Render
             with open(meta_path, "r", encoding="utf-8") as f:
                 METADATA = json.load(f)
-            print(f"[Scanner] Indice caricato da {base_dir}: {len(METADATA)} carte pronte in RAM.")
+
+            # Indice rapido per filtro espansioni
+            by_set: dict[str, list[int]] = {}
+            set_names: dict[str, str] = {}
+            for idx, m in enumerate(METADATA):
+                code = (m.get("set_code") or "").upper()
+                if not code:
+                    continue
+                by_set.setdefault(code, []).append(idx)
+                if code not in set_names and m.get("set_name"):
+                    set_names[code] = m["set_name"]
+
+            SET_TO_INDICES = {k: np.array(v, dtype=np.int32) for k, v in by_set.items()}
+            AVAILABLE_SETS = sorted(
+                [{"code": k, "name": set_names.get(k, k), "count": len(v)} for k, v in by_set.items()],
+                key=lambda x: x["name"].lower(),
+            )
+            print(f"[Scanner] Indice caricato da {base_dir}: {len(METADATA)} carte ({VECTORS.dtype}, {VECTORS.shape}).")
             return
+
     print("[Scanner] ATTENZIONE: Indice non trovato. Esegui prima: python build_index.py")
-    
+
+
 @app.on_event("startup")
 def on_startup():
     load_visual_index()
 
 
+def normalize_lighting_bgr(img_bgr: np.ndarray) -> np.ndarray:
+    """Bilanciamento del bianco Gray World leggero per ridurre dominanti di luce artificiale."""
+    img = img_bgr.astype(np.float32)
+    avg_b, avg_g, avg_r = np.mean(img[:, :, 0]), np.mean(img[:, :, 1]), np.mean(img[:, :, 2])
+    avg_gray = (avg_b + avg_g + avg_r) / 3.0
+    if avg_gray < 1e-3:
+        return img_bgr
+    img[:, :, 0] *= np.clip(avg_gray / max(avg_b, 1.0), 0.75, 1.35)
+    img[:, :, 1] *= np.clip(avg_gray / max(avg_g, 1.0), 0.75, 1.35)
+    img[:, :, 2] *= np.clip(avg_gray / max(avg_r, 1.0), 0.75, 1.35)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
 def order_quad_points(pts: np.ndarray) -> np.ndarray:
-    """Ordina 4 punti nel formato: [top-left, top-right, bottom-right, bottom-left]."""
     rect = np.zeros((4, 2), dtype=np.float32)
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
@@ -60,7 +101,6 @@ def order_quad_points(pts: np.ndarray) -> np.ndarray:
 
 
 def _quad_contains(outer: np.ndarray, inner: np.ndarray) -> bool:
-    """Restituisce True se almeno 3 vertici di inner cadono dentro il poligono outer."""
     inside_count = 0
     for pt in inner:
         if cv2.pointPolygonTest(outer, (float(pt[0]), float(pt[1])), False) >= 0:
@@ -69,21 +109,15 @@ def _quad_contains(outer: np.ndarray, inner: np.ndarray) -> bool:
 
 
 def detect_and_warp_card(frame_bgr: np.ndarray) -> tuple[np.ndarray | None, list[list[float]] | None]:
-    """
-    Cerca il contorno esterno della carta Magic nel fotogramma, ignorando
-    i riquadri interni (box del testo o dell'artwork).
-    """
     fh, fw = frame_bgr.shape[:2]
     frame_area = float(fh * fw)
 
-    # Sfocatura leggera + gradiente su tutti e 3 i canali BGR (non solo grigio,
-    # così rileva anche bordi neri su superfici scure o colorate)
     blurred = cv2.GaussianBlur(frame_bgr, (5, 5), 0)
     b_ch, g_ch, r_ch = cv2.split(blurred)
-    edges_b = cv2.Canny(b_ch, 35, 110)
-    edges_g = cv2.Canny(g_ch, 35, 110)
-    edges_r = cv2.Canny(r_ch, 35, 110)
-    edges = cv2.bitwise_or(edges_b, cv2.bitwise_or(edges_g, edges_r))
+    edges = cv2.bitwise_or(
+        cv2.Canny(b_ch, 35, 110),
+        cv2.bitwise_or(cv2.Canny(g_ch, 35, 110), cv2.Canny(r_ch, 35, 110)),
+    )
 
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
@@ -92,11 +126,8 @@ def detect_and_warp_card(frame_bgr: np.ndarray) -> tuple[np.ndarray | None, list
     contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
 
     candidates: list[tuple[float, float, np.ndarray]] = []
-
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        # Una carta inquadrata occupa in genere almeno il 12% del fotogramma;
-        # i box interni del testo sono molto più piccoli a parità di inquadratura.
         if area < frame_area * 0.12 or area > frame_area * 0.90:
             continue
 
@@ -116,7 +147,6 @@ def detect_and_warp_card(frame_bgr: np.ndarray) -> tuple[np.ndarray | None, list
         if avg_w < 50 or avg_h < 50:
             continue
 
-        # Rapporto carta Magic: 63x88 mm -> ~1.397
         ratio = max(avg_h, avg_w) / max(1.0, min(avg_h, avg_w))
         if not (1.22 <= ratio <= 1.62):
             continue
@@ -133,8 +163,6 @@ def detect_and_warp_card(frame_bgr: np.ndarray) -> tuple[np.ndarray | None, list
     if not candidates:
         return None, None
 
-    # Scarta qualsiasi quadrilatero che sia contenuto dentro un candidato più grande
-    # (es. il riquadro del testo delle regole dentro il bordo esterno della carta)
     outer_candidates = []
     for i, (score_i, area_i, quad_i) in enumerate(candidates):
         is_inner = False
@@ -149,16 +177,12 @@ def detect_and_warp_card(frame_bgr: np.ndarray) -> tuple[np.ndarray | None, list
     pool.sort(key=lambda x: x[0], reverse=True)
     best_quad = pool[0][2]
 
-    # Se la carta è inquadrata in orizzontale, ruota l'ordine dei vertici per mantenerla verticale
     w_est = np.linalg.norm(best_quad[1] - best_quad[0])
     h_est = np.linalg.norm(best_quad[3] - best_quad[0])
     if w_est > h_est:
         best_quad = np.roll(best_quad, -1, axis=0)
 
-    dst_pts = np.array(
-        [[0, 0], [251, 0], [251, 351], [0, 351]],
-        dtype=np.float32,
-    )
+    dst_pts = np.array([[0, 0], [251, 0], [251, 351], [0, 351]], dtype=np.float32)
     M = cv2.getPerspectiveTransform(best_quad, dst_pts)
     warped = cv2.warpPerspective(frame_bgr, M, (252, 352))
 
@@ -169,34 +193,79 @@ def detect_and_warp_card(frame_bgr: np.ndarray) -> tuple[np.ndarray | None, list
     return warped, norm_quad
 
 
-def match_warped_card(card_bgr: np.ndarray, top_k: int = 5) -> list[dict[str, Any]]:
+def _chunked_max_similarity(
+    queries: np.ndarray,  # (Q, D) float32
+    subset_indices: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Calcola la similarità coseno massima tra Q varianti della carta e l'indice int8 senza picchi di RAM."""
+    assert VECTORS is not None
+    is_int8 = VECTORS.dtype == np.int8
+    scale = (1.0 / 127.0) if is_int8 else 1.0
+    q_t = (queries * scale).T  # (D, Q)
+
+    if subset_indices is not None:
+        sub = VECTORS[subset_indices].astype(np.float32)
+        sims = np.max(sub @ q_t, axis=1)
+        return sims, subset_indices
+
+    n = VECTORS.shape[0]
+    sims = np.empty(n, dtype=np.float32)
+    chunk_size = 16384
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        block = VECTORS[start:end].astype(np.float32)
+        sims[start:end] = np.max(block @ q_t, axis=1)
+    return sims, None
+
+
+def match_warped_card(
+    card_bgr: np.ndarray,
+    top_k: int = 5,
+    allowed_sets: list[str] | None = None,
+) -> list[dict[str, Any]]:
     if VECTORS is None or len(METADATA) == 0:
         return []
 
-    # Calcola firma sia dritta sia ruotata di 180° (se la carta è capovolta sul tavolo)
-    vec_0 = compute_card_descriptor(card_bgr)
-    vec_180 = compute_card_descriptor(cv2.rotate(card_bgr, cv2.ROTATE_180))
+    subset_indices: np.ndarray | None = None
+    if allowed_sets:
+        idx_parts = [SET_TO_INDICES[s.upper()] for s in allowed_sets if s.upper() in SET_TO_INDICES]
+        if idx_parts:
+            subset_indices = np.concatenate(idx_parts)
 
-    sims_0 = VECTORS @ vec_0
-    sims_180 = VECTORS @ vec_180
-    sims = np.maximum(sims_0, sims_180)
+    norm_card = normalize_lighting_bgr(card_bgr)
+    rot_card = cv2.rotate(norm_card, cv2.ROTATE_180)
 
-    k = min(top_k, len(METADATA))
-    top_indices = np.argpartition(-sims, k - 1)[:k]
-    top_indices = top_indices[np.argsort(-sims[top_indices])]
+    # 3 varianti: dritta standard, dritta leggermente stretta (sleeve), capovolta 180°
+    q_vecs = np.vstack([
+        compute_card_descriptor(norm_card, crop_margin=0.0),
+        compute_card_descriptor(norm_card, crop_margin=0.04),
+        compute_card_descriptor(rot_card, crop_margin=0.0),
+    ]).astype(np.float32)
+
+    sims, idx_map = _chunked_max_similarity(q_vecs, subset_indices)
+    if len(sims) == 0:
+        return []
+
+    k = min(top_k, len(sims))
+    top_local = np.argpartition(-sims, k - 1)[:k]
+    top_local = top_local[np.argsort(-sims[top_local])]
 
     results = []
-    for idx in top_indices:
-        score = float(sims[idx])
-        if score < 0.62:
+    for loc_idx in top_local:
+        score = float(sims[loc_idx])
+        if score < 0.58:
             continue
-        item = dict(METADATA[int(idx)])
+        global_idx = int(idx_map[loc_idx]) if idx_map is not None else int(loc_idx)
+        item = dict(METADATA[global_idx])
         item["confidence"] = round(score, 4)
         results.append(item)
     return results
 
 
-def analyze_frame_bytes(img_bytes: bytes) -> dict[str, Any]:
+def analyze_frame_bytes(
+    img_bytes: bytes,
+    allowed_sets: list[str] | None = None,
+) -> dict[str, Any]:
     arr = np.frombuffer(img_bytes, dtype=np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if frame is None:
@@ -206,7 +275,7 @@ def analyze_frame_bytes(img_bytes: bytes) -> dict[str, Any]:
     if warped is None:
         return {"detected": False, "quad": None, "matches": []}
 
-    matches = match_warped_card(warped, top_k=5)
+    matches = match_warped_card(warped, top_k=5, allowed_sets=allowed_sets)
     return {
         "detected": True,
         "quad": quad,
@@ -216,7 +285,16 @@ def analyze_frame_bytes(img_bytes: bytes) -> dict[str, Any]:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "indexed_cards": len(METADATA)}
+    return {
+        "status": "ok",
+        "indexed_cards": len(METADATA),
+        "model": "mobilenet_v3_small_onnx",
+    }
+
+
+@app.get("/sets")
+def list_sets():
+    return {"sets": AVAILABLE_SETS}
 
 
 @app.post("/scan-frame")
@@ -228,18 +306,29 @@ async def scan_frame_http(file: UploadFile = File(...)):
 @app.websocket("/ws/scan")
 async def scan_websocket(websocket: WebSocket):
     await websocket.accept()
+    allowed_sets: list[str] | None = None
     try:
         while True:
             msg = await websocket.receive()
             if "bytes" in msg and msg["bytes"] is not None:
-                res = analyze_frame_bytes(msg["bytes"])
+                res = analyze_frame_bytes(msg["bytes"], allowed_sets=allowed_sets)
                 await websocket.send_json(res)
             elif "text" in msg and msg["text"] is not None:
-                raw = msg["text"]
+                raw = msg["text"].strip()
+                if raw.startswith("{"):
+                    try:
+                        cfg = json.loads(raw)
+                        if cfg.get("type") == "config":
+                            sets = cfg.get("sets")
+                            allowed_sets = [str(s).upper() for s in sets if s] if sets else None
+                            await websocket.send_json({"type": "config_ack", "sets": allowed_sets or []})
+                            continue
+                    except Exception:
+                        pass
                 if "," in raw:
                     raw = raw.split(",", 1)[1]
                 img_bytes = base64.b64decode(raw)
-                res = analyze_frame_bytes(img_bytes)
+                res = analyze_frame_bytes(img_bytes, allowed_sets=allowed_sets)
                 await websocket.send_json(res)
     except WebSocketDisconnect:
         pass
