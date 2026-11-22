@@ -194,29 +194,29 @@ def detect_and_warp_card(frame_bgr: np.ndarray) -> tuple[np.ndarray | None, list
 
 
 def _chunked_max_similarity(
-    queries: np.ndarray,  # (Q, D) float32
+    queries: np.ndarray,
     subset_indices: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
-    """Calcola la similarità coseno massima tra Q varianti della carta e l'indice int8 senza picchi di RAM."""
     assert VECTORS is not None
     is_int8 = VECTORS.dtype == np.int8
     scale = (1.0 / 127.0) if is_int8 else 1.0
-    q_t = (queries * scale).T  # (D, Q)
+
+    single_query = queries.ndim == 1
+    q_t = (queries * scale) if single_query else (queries * scale).T
 
     if subset_indices is not None:
         sub = VECTORS[subset_indices].astype(np.float32)
-        sims = np.max(sub @ q_t, axis=1)
+        sims = (sub @ q_t) if single_query else np.max(sub @ q_t, axis=1)
         return sims, subset_indices
 
     n = VECTORS.shape[0]
     sims = np.empty(n, dtype=np.float32)
-    chunk_size = 16384
+    chunk_size = 32768
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
         block = VECTORS[start:end].astype(np.float32)
-        sims[start:end] = np.max(block @ q_t, axis=1)
+        sims[start:end] = (block @ q_t) if single_query else np.max(block @ q_t, axis=1)
     return sims, None
-
 
 def match_warped_card(
     card_bgr: np.ndarray,
