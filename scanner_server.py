@@ -233,18 +233,18 @@ def match_warped_card(
             subset_indices = np.concatenate(idx_parts)
 
     norm_card = normalize_lighting_bgr(card_bgr)
-    rot_card = cv2.rotate(norm_card, cv2.ROTATE_180)
 
-    # 3 varianti: dritta standard, dritta leggermente stretta (sleeve), capovolta 180°
-    q_vecs = np.vstack([
-        compute_card_descriptor(norm_card, crop_margin=0.0),
-        compute_card_descriptor(norm_card, crop_margin=0.04),
-        compute_card_descriptor(rot_card, crop_margin=0.0),
-    ]).astype(np.float32)
-
-    sims, idx_map = _chunked_max_similarity(q_vecs, subset_indices)
+    # 1° passaggio: solo dritta standard (1 inferenza + ricerca 1D)
+    q_main = compute_card_descriptor(norm_card, crop_margin=0.0).astype(np.float32)
+    sims, idx_map = _chunked_max_similarity(q_main, subset_indices)
     if len(sims) == 0:
         return []
+
+    # Fallback leggero solo per carte in bustina/sleeve se il primo score è basso
+    if float(np.max(sims)) < 0.72:
+        q_sleeve = compute_card_descriptor(norm_card, crop_margin=0.04).astype(np.float32)
+        sims_sleeve, _ = _chunked_max_similarity(q_sleeve, subset_indices)
+        sims = np.maximum(sims, sims_sleeve)
 
     k = min(top_k, len(sims))
     top_local = np.argpartition(-sims, k - 1)[:k]
