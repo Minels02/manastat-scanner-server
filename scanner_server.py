@@ -48,9 +48,9 @@ def _build_usearch_background() -> None:
             ndim=dim,
             metric="cos",
             dtype="i8" if is_int8 else "f32",
-            connectivity=16,
+            connectivity=24,
             expansion_add=64,
-            expansion_search=32,
+            expansion_search=96,
         )
         keys = np.arange(n, dtype=np.uint64)
         batch_size = 16384
@@ -383,7 +383,7 @@ def match_warped_card(
 
     results = []
     for global_idx, score in hits:
-        if score < 0.58:
+        if score < 0.66:
             continue
         item = dict(METADATA[global_idx])
         item["confidence"] = round(score, 4)
